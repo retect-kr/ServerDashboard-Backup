@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.serverdashboard.backup"
-version = "1.2.1"
+version = "1.2.2"
 
 java {
     toolchain {
@@ -36,6 +36,9 @@ tasks {
             if (it.isDirectory) it else zipTree(it)
         }) {
             exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/MANIFEST.MF")
+            exclude("META-INF/versions/**")   // strip multi-release classes — prevents module-info confusion
+            exclude("META-INF/maven/**")
+            exclude("module-info.class")
         }
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     }

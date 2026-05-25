@@ -679,6 +679,8 @@ public class BackupModule implements DashboardModule {
         }
         .bk-status.done{border-left-color:var(--green);}
         .bk-status.err{border-left-color:var(--red);}
+        @keyframes bk-spin{to{transform:rotate(360deg)}}
+        .bk-spin{animation:bk-spin .9s linear infinite;display:inline-block;}
         .bk-cfg-panel{
           margin-top:10px;padding:12px;border-radius:8px;
           background:var(--surface-3);border:1px solid var(--border);
@@ -981,14 +983,30 @@ public class BackupModule implements DashboardModule {
             }
           }
 
-          async function loadList() {
-            const list = await bkFetch('GET', '/list');
+          function renderList(list, status) {
             const el = document.getElementById('bk-list');
+            let html = '';
+            if (status && status.running) {
+              html += `<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;
+                background:var(--accent-dim);border-radius:8px;border:1px solid rgba(99,102,241,.3)">
+                <div style="width:32px;height:32px;border-radius:7px;background:rgba(99,102,241,.18);
+                  display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                  <i class="ti ti-loader-2 bk-spin" style="font-size:16px;color:var(--accent-2)"></i>
+                </div>
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:12.5px;font-weight:500">백업 진행중</div>
+                  <div style="font-size:11px;color:var(--text-2);margin-top:2px;font-family:var(--mono)">${status.status || '...'}</div>
+                </div>
+              </div>`;
+            }
             if (!Array.isArray(list) || !list.length) {
-              el.innerHTML = '<div class="empty"><i class="ti ti-database-off"></i><p>저장된 백업 없음</p></div>';
+              if (!status || !status.running) {
+                html = '<div class="empty"><i class="ti ti-database-off"></i><p>저장된 백업 없음</p></div>';
+              }
+              el.innerHTML = html;
               return;
             }
-            el.innerHTML = list.map(f => `
+            html += list.map(f => `
               <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;
                 background:var(--surface-2);border-radius:8px;border:1px solid var(--border)">
                 <div style="width:34px;height:34px;border-radius:7px;background:var(--accent-dim);
@@ -1012,6 +1030,15 @@ public class BackupModule implements DashboardModule {
                 </div>
               </div>
             `).join('');
+            el.innerHTML = html;
+          }
+
+          async function loadList() {
+            const [list, status] = await Promise.all([
+              bkFetch('GET', '/list'), bkFetch('GET', '/status')
+            ]);
+            renderList(list, status);
+            if (status.running && !pollId) startPoll('', false);
           }
 
           window.bkDl = function(name) {
@@ -1038,14 +1065,17 @@ public class BackupModule implements DashboardModule {
           let pollId = null;
           function startPoll(filename, doDownload) {
             if (pollId) clearInterval(pollId);
+            document.getElementById('bk-run').disabled = true;
             pollId = setInterval(async () => {
               const s = await bkFetch('GET', '/status');
               const isDone = !s.running;
               const isErr  = s.status && s.status.startsWith('Error');
               setStatus(s.status || '', isDone ? (isErr ? 'err' : 'done') : '');
+              const list = await bkFetch('GET', '/list');
+              renderList(list, s);
               if (isDone) {
                 clearInterval(pollId); pollId = null;
-                loadList();
+                document.getElementById('bk-run').disabled = false;
                 if (doDownload && !isErr) bkDl(filename);
               }
             }, 1000);
