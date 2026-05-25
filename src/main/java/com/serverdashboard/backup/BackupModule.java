@@ -1,15 +1,21 @@
 package com.serverdashboard.backup;
 
 import com.google.gson.*;
+import com.jcraft.jsch.*;
 import com.serverdashboard.DashboardPlugin;
 import com.serverdashboard.api.DashboardModule;
 import com.sun.net.httpserver.HttpExchange;
 import org.bukkit.Bukkit;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.LocalDateTime;
+import java.security.MessageDigest;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
@@ -28,10 +34,30 @@ public class BackupModule implements DashboardModule {
     private volatile boolean running = false;
     private volatile String statusMsg = "Idle";
 
+    // Target config
     private final Set<String> cfgTargets = new LinkedHashSet<>(List.of("worlds"));
-    private boolean cfgAutoEnabled = false;
-    private int cfgIntervalHours = 24;
-    private int cfgMaxBackups = 5;
+
+    // Storage config
+    private String cfgStorage = "local";
+
+    // S3 config
+    private String cfgS3Endpoint  = "https://s3.amazonaws.com";
+    private String cfgS3Bucket    = "";
+    private String cfgS3Region    = "us-east-1";
+    private String cfgS3AccessKey = "";
+    private String cfgS3SecretKey = "";
+
+    // SFTP config
+    private String cfgSftpHost = "";
+    private int    cfgSftpPort = 22;
+    private String cfgSftpUser = "";
+    private String cfgSftpPass = "";
+    private String cfgSftpPath = "/backups";
+
+    // Auto backup config
+    private boolean cfgAutoEnabled   = false;
+    private int     cfgIntervalHours = 24;
+    private int     cfgMaxBackups    = 5;
 
     @Override public String getId()   { return "backup"; }
     @Override public String getName() { return "Backup"; }
@@ -48,9 +74,7 @@ public class BackupModule implements DashboardModule {
     }
 
     @Override
-    public void onUnload() {
-        cancelAuto();
-    }
+    public void onUnload() { cancelAuto(); }
 
     @Override
     public void handleRoute(String path, String method, HttpExchange ex) throws Exception {
@@ -69,6 +93,7 @@ public class BackupModule implements DashboardModule {
     private void handleRun(HttpExchange ex) throws Exception {
         if (running) { sendJson(ex, 409, "{\"error\":\"Backup already in progress\"}"); return; }
         JsonObject body = parseBody(ex);
+
         List<String> targets = new ArrayList<>();
         if (body.has("targets")) {
             for (JsonElement e : body.getAsJsonArray("targets")) targets.add(e.getAsString());
@@ -77,24 +102,30 @@ public class BackupModule implements DashboardModule {
         }
         if (targets.isEmpty()) { sendJson(ex, 400, "{\"error\":\"No targets selected\"}"); return; }
 
+        String storage = body.has("storage") ? body.get("storage").getAsString() : cfgStorage;
         String filename = "backup-" + LocalDateTime.now().format(TS) + ".zip";
         Path zipPath = backupsDir.resolve(filename);
         running = true;
         statusMsg = "Saving worlds...";
 
-        // Save worlds on main thread first
         CompletableFuture<Void> saveFuture = new CompletableFuture<>();
         Bukkit.getScheduler().runTask(plugin, () -> {
             try { Bukkit.getWorlds().forEach(org.bukkit.World::save); saveFuture.complete(null); }
             catch (Exception e) { saveFuture.completeExceptionally(e); }
         });
-        try { saveFuture.get(30, TimeUnit.SECONDS); }
-        catch (Exception ignored) {}
+        try { saveFuture.get(30, TimeUnit.SECONDS); } catch (Exception ignored) {}
 
         new Thread(() -> {
             try {
                 statusMsg = "Creating ZIP...";
                 createZip(targets, zipPath);
+                if ("s3".equals(storage)) {
+                    statusMsg = "Uploading to S3...";
+                    uploadToS3(zipPath, filename);
+                } else if ("sftp".equals(storage)) {
+                    statusMsg = "Uploading via SFTP...";
+                    uploadToSftp(zipPath, filename);
+                }
                 if (cfgMaxBackups > 0) pruneOld();
                 statusMsg = "Done: " + filename;
             } catch (Exception e) {
@@ -105,6 +136,7 @@ public class BackupModule implements DashboardModule {
 
         JsonObject resp = new JsonObject();
         resp.addProperty("file", filename);
+        resp.addProperty("storage", storage);
         sendJson(ex, 202, GSON.toJson(resp));
     }
 
@@ -169,9 +201,30 @@ public class BackupModule implements DashboardModule {
             cfgTargets.clear();
             for (JsonElement e : body.getAsJsonArray("targets")) cfgTargets.add(e.getAsString());
         }
+        if (body.has("storage"))       cfgStorage       = body.get("storage").getAsString();
         if (body.has("autoEnabled"))   cfgAutoEnabled   = body.get("autoEnabled").getAsBoolean();
         if (body.has("intervalHours")) cfgIntervalHours = Math.max(1, body.get("intervalHours").getAsInt());
         if (body.has("maxBackups"))    cfgMaxBackups    = Math.max(0, body.get("maxBackups").getAsInt());
+
+        if (body.has("s3")) {
+            JsonObject s3 = body.getAsJsonObject("s3");
+            if (s3.has("endpoint"))  cfgS3Endpoint  = s3.get("endpoint").getAsString();
+            if (s3.has("bucket"))    cfgS3Bucket    = s3.get("bucket").getAsString();
+            if (s3.has("region"))    cfgS3Region    = s3.get("region").getAsString();
+            if (s3.has("accessKey")) cfgS3AccessKey = s3.get("accessKey").getAsString();
+            if (s3.has("secretKey") && !s3.get("secretKey").getAsString().equals("***"))
+                cfgS3SecretKey = s3.get("secretKey").getAsString();
+        }
+        if (body.has("sftp")) {
+            JsonObject sftp = body.getAsJsonObject("sftp");
+            if (sftp.has("host"))       cfgSftpHost = sftp.get("host").getAsString();
+            if (sftp.has("port"))       cfgSftpPort = Math.max(1, sftp.get("port").getAsInt());
+            if (sftp.has("username"))   cfgSftpUser = sftp.get("username").getAsString();
+            if (sftp.has("password") && !sftp.get("password").getAsString().equals("***"))
+                cfgSftpPass = sftp.get("password").getAsString();
+            if (sftp.has("remotePath")) cfgSftpPath = sftp.get("remotePath").getAsString();
+        }
+
         saveConfig();
         cancelAuto();
         scheduleAuto();
@@ -250,6 +303,106 @@ public class BackupModule implements DashboardModule {
         }
     }
 
+    // ── S3 Upload (AWS Signature V4) ──────────────────────────────────────────
+
+    private void uploadToS3(Path file, String name) throws Exception {
+        String endpoint = cfgS3Endpoint.replaceAll("/+$", "");
+        URL url = new URL(endpoint + "/" + cfgS3Bucket + "/" + name);
+        long fileSize = Files.size(file);
+
+        String payloadHash = sha256Hex(file);
+
+        ZonedDateTime now = ZonedDateTime.now(ZoneOffset.UTC);
+        String date     = now.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String datetime = now.format(DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'"));
+        String host = url.getHost() + (url.getPort() != -1 ? ":" + url.getPort() : "");
+        String path = url.getPath().isEmpty() ? "/" : url.getPath();
+
+        String canonicalHeaders = "host:" + host + "\n" +
+                                  "x-amz-content-sha256:" + payloadHash + "\n" +
+                                  "x-amz-date:" + datetime + "\n";
+        String signedHeaders    = "host;x-amz-content-sha256;x-amz-date";
+        String canonicalRequest = "PUT\n" + path + "\n\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash;
+
+        String scope        = date + "/" + cfgS3Region + "/s3/aws4_request";
+        String stringToSign = "AWS4-HMAC-SHA256\n" + datetime + "\n" + scope + "\n" +
+                              sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+
+        byte[] sigKey = hmacSha256(
+            hmacSha256(hmacSha256(
+                hmacSha256(("AWS4" + cfgS3SecretKey).getBytes(StandardCharsets.UTF_8), date),
+                cfgS3Region), "s3"), "aws4_request");
+        String signature = hexEncode(hmacSha256(sigKey, stringToSign));
+
+        String auth = "AWS4-HMAC-SHA256 Credential=" + cfgS3AccessKey + "/" + scope +
+                      ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
+
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("PUT");
+        conn.setFixedLengthStreamingMode(fileSize);
+        conn.setRequestProperty("Host", host);
+        conn.setRequestProperty("x-amz-date", datetime);
+        conn.setRequestProperty("x-amz-content-sha256", payloadHash);
+        conn.setRequestProperty("Authorization", auth);
+        conn.setRequestProperty("Content-Type", "application/zip");
+        conn.setDoOutput(true);
+        try (InputStream in = Files.newInputStream(file); OutputStream out = conn.getOutputStream()) {
+            in.transferTo(out);
+        }
+        int status = conn.getResponseCode();
+        if (status / 100 != 2) {
+            InputStream err = conn.getErrorStream();
+            String errBody = err != null ? new String(err.readAllBytes(), StandardCharsets.UTF_8) : "";
+            throw new IOException("S3 upload failed: HTTP " + status + " " + errBody.strip());
+        }
+    }
+
+    // ── SFTP Upload ───────────────────────────────────────────────────────────
+
+    private void uploadToSftp(Path file, String name) throws Exception {
+        JSch jsch = new JSch();
+        Session session = jsch.getSession(cfgSftpUser, cfgSftpHost, cfgSftpPort);
+        session.setPassword(cfgSftpPass);
+        session.setConfig("StrictHostKeyChecking", "no");
+        session.connect(30_000);
+        try {
+            ChannelSftp ch = (ChannelSftp) session.openChannel("sftp");
+            ch.connect();
+            try {
+                try { ch.mkdir(cfgSftpPath); } catch (SftpException ignored) {}
+                ch.cd(cfgSftpPath);
+                try (InputStream in = Files.newInputStream(file)) { ch.put(in, name); }
+            } finally { ch.disconnect(); }
+        } finally { session.disconnect(); }
+    }
+
+    // ── Crypto helpers ────────────────────────────────────────────────────────
+
+    private static String sha256Hex(Path file) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        try (InputStream in = Files.newInputStream(file)) {
+            byte[] buf = new byte[65536]; int n;
+            while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+        }
+        return hexEncode(md.digest());
+    }
+
+    private static String sha256Hex(byte[] data) throws Exception {
+        return hexEncode(MessageDigest.getInstance("SHA-256").digest(data));
+    }
+
+    private static byte[] hmacSha256(byte[] key, String data) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key, "HmacSHA256"));
+        return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String hexEncode(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
+    }
+
     // ── Auto backup ───────────────────────────────────────────────────────────
 
     private void scheduleAuto() {
@@ -277,6 +430,14 @@ public class BackupModule implements DashboardModule {
         try {
             f.get(30, TimeUnit.SECONDS);
             createZip(new ArrayList<>(cfgTargets), zipPath);
+            // Auto-backup uploads to remote if configured (skip "download" mode)
+            if ("s3".equals(cfgStorage)) {
+                statusMsg = "Auto: Uploading to S3...";
+                uploadToS3(zipPath, filename);
+            } else if ("sftp".equals(cfgStorage)) {
+                statusMsg = "Auto: Uploading via SFTP...";
+                uploadToSftp(zipPath, filename);
+            }
             if (cfgMaxBackups > 0) pruneOld();
             statusMsg = "Done: " + filename;
             plugin.getLogger().info("[Backup] Auto backup complete: " + filename);
@@ -300,27 +461,64 @@ public class BackupModule implements DashboardModule {
                 cfgTargets.clear();
                 o.getAsJsonArray("targets").forEach(e -> cfgTargets.add(e.getAsString()));
             }
+            if (o.has("storage"))       cfgStorage       = o.get("storage").getAsString();
             if (o.has("autoEnabled"))   cfgAutoEnabled   = o.get("autoEnabled").getAsBoolean();
             if (o.has("intervalHours")) cfgIntervalHours = o.get("intervalHours").getAsInt();
             if (o.has("maxBackups"))    cfgMaxBackups    = o.get("maxBackups").getAsInt();
+            if (o.has("s3")) {
+                JsonObject s3 = o.getAsJsonObject("s3");
+                if (s3.has("endpoint"))  cfgS3Endpoint  = s3.get("endpoint").getAsString();
+                if (s3.has("bucket"))    cfgS3Bucket    = s3.get("bucket").getAsString();
+                if (s3.has("region"))    cfgS3Region    = s3.get("region").getAsString();
+                if (s3.has("accessKey")) cfgS3AccessKey = s3.get("accessKey").getAsString();
+                if (s3.has("secretKey")) cfgS3SecretKey = s3.get("secretKey").getAsString();
+            }
+            if (o.has("sftp")) {
+                JsonObject sftp = o.getAsJsonObject("sftp");
+                if (sftp.has("host"))       cfgSftpHost = sftp.get("host").getAsString();
+                if (sftp.has("port"))       cfgSftpPort = sftp.get("port").getAsInt();
+                if (sftp.has("username"))   cfgSftpUser = sftp.get("username").getAsString();
+                if (sftp.has("password"))   cfgSftpPass = sftp.get("password").getAsString();
+                if (sftp.has("remotePath")) cfgSftpPath = sftp.get("remotePath").getAsString();
+            }
         } catch (Exception e) {
             plugin.getLogger().warning("[Backup] Config load failed: " + e.getMessage());
         }
     }
 
     private void saveConfig() {
-        try { Files.writeString(configPath(), GSON.toJson(buildConfigJson())); }
+        try { Files.writeString(configPath(), GSON.toJson(buildConfigJson(true))); }
         catch (IOException e) { plugin.getLogger().warning("[Backup] Config save failed: " + e.getMessage()); }
     }
 
-    private JsonObject buildConfigJson() {
+    private JsonObject buildConfigJson() { return buildConfigJson(false); }
+
+    private JsonObject buildConfigJson(boolean includeSensitive) {
         JsonObject o = new JsonObject();
         JsonArray arr = new JsonArray();
         cfgTargets.forEach(arr::add);
         o.add("targets", arr);
+        o.addProperty("storage", cfgStorage);
         o.addProperty("autoEnabled", cfgAutoEnabled);
         o.addProperty("intervalHours", cfgIntervalHours);
         o.addProperty("maxBackups", cfgMaxBackups);
+
+        JsonObject s3 = new JsonObject();
+        s3.addProperty("endpoint",  cfgS3Endpoint);
+        s3.addProperty("bucket",    cfgS3Bucket);
+        s3.addProperty("region",    cfgS3Region);
+        s3.addProperty("accessKey", cfgS3AccessKey);
+        s3.addProperty("secretKey", includeSensitive ? cfgS3SecretKey : (cfgS3SecretKey.isEmpty() ? "" : "***"));
+        o.add("s3", s3);
+
+        JsonObject sftp = new JsonObject();
+        sftp.addProperty("host",       cfgSftpHost);
+        sftp.addProperty("port",       cfgSftpPort);
+        sftp.addProperty("username",   cfgSftpUser);
+        sftp.addProperty("password",   includeSensitive ? cfgSftpPass : (cfgSftpPass.isEmpty() ? "" : "***"));
+        sftp.addProperty("remotePath", cfgSftpPath);
+        o.add("sftp", sftp);
+
         return o;
     }
 
@@ -348,7 +546,6 @@ public class BackupModule implements DashboardModule {
 
     private static final String HTML = """
         <style>
-        /* ── Backup module components ──────────────────────── */
         .bk-chk,.bk-radio{
           display:flex;align-items:center;gap:10px;cursor:pointer;
           padding:8px 10px;border-radius:7px;font-size:13px;
@@ -359,21 +556,14 @@ public class BackupModule implements DashboardModule {
           background:var(--accent-dim);border-color:rgba(99,102,241,.3);
         }
         .bk-chk input,.bk-radio input{display:none;}
-
-        /* custom checkbox box */
         .bk-box{
           width:17px;height:17px;border-radius:4px;flex-shrink:0;
           border:1.5px solid var(--border-2);background:var(--surface-3);
-          display:flex;align-items:center;justify-content:center;
-          transition:all .13s;
+          display:flex;align-items:center;justify-content:center;transition:all .13s;
         }
         .bk-chk:hover .bk-box{border-color:var(--accent);}
         .bk-chk:has(input:checked) .bk-box{background:var(--accent);border-color:var(--accent);}
-        .bk-chk:has(input:checked) .bk-box::after{
-          content:'✓';color:#fff;font-size:10px;font-weight:800;line-height:1;
-        }
-
-        /* custom radio dot */
+        .bk-chk:has(input:checked) .bk-box::after{content:'✓';color:#fff;font-size:10px;font-weight:800;line-height:1;}
         .bk-dot{
           width:17px;height:17px;border-radius:50%;flex-shrink:0;
           border:1.5px solid var(--border-2);background:var(--surface-3);
@@ -386,21 +576,14 @@ public class BackupModule implements DashboardModule {
           background:var(--accent);position:absolute;
           top:50%;left:50%;transform:translate(-50%,-50%);
         }
-
-        /* option icon badge */
         .bk-ico{
           width:32px;height:32px;border-radius:7px;flex-shrink:0;
           background:var(--surface-3);
-          display:flex;align-items:center;justify-content:center;
-          transition:all .13s;
+          display:flex;align-items:center;justify-content:center;transition:all .13s;
         }
         .bk-ico i{font-size:16px;color:var(--text-2);transition:color .13s;}
-        .bk-chk:has(input:checked) .bk-ico,
-        .bk-radio:has(input:checked) .bk-ico{background:rgba(99,102,241,.18);}
-        .bk-chk:has(input:checked) .bk-ico i,
-        .bk-radio:has(input:checked) .bk-ico i{color:var(--accent-2);}
-
-        /* number input */
+        .bk-chk:has(input:checked) .bk-ico,.bk-radio:has(input:checked) .bk-ico{background:rgba(99,102,241,.18);}
+        .bk-chk:has(input:checked) .bk-ico i,.bk-radio:has(input:checked) .bk-ico i{color:var(--accent-2);}
         .bk-num{
           background:var(--surface-2);border:1px solid var(--border-2);
           border-radius:6px;padding:6px 9px;color:var(--text);
@@ -408,14 +591,17 @@ public class BackupModule implements DashboardModule {
           transition:border-color .12s;text-align:center;
         }
         .bk-num:focus{outline:none;border-color:var(--accent);}
-
-        /* section label */
+        .bk-input{
+          background:var(--surface-2);border:1px solid var(--border-2);
+          border-radius:6px;padding:6px 10px;color:var(--text);
+          font-size:13px;font-family:var(--font);width:100%;box-sizing:border-box;
+          transition:border-color .12s;
+        }
+        .bk-input:focus{outline:none;border-color:var(--accent);}
         .bk-lbl{
           font-size:10.5px;font-weight:600;text-transform:uppercase;
           letter-spacing:.6px;color:var(--text-3);padding:0 2px;margin-bottom:5px;
         }
-
-        /* status bar */
         .bk-status{
           display:none;margin-top:10px;padding:9px 12px;
           border-radius:6px;border-left:3px solid var(--accent);
@@ -424,9 +610,17 @@ public class BackupModule implements DashboardModule {
         }
         .bk-status.done{border-left-color:var(--green);}
         .bk-status.err{border-left-color:var(--red);}
+        .bk-cfg-panel{
+          margin-top:10px;padding:12px;border-radius:8px;
+          background:var(--surface-3);border:1px solid var(--border);
+          display:flex;flex-direction:column;gap:9px;
+        }
+        .bk-field{display:flex;flex-direction:column;gap:4px;}
+        .bk-field label{font-size:11.5px;color:var(--text-2);}
+        .bk-field-row{display:grid;gap:9px;}
         </style>
 
-        <div style="display:grid;grid-template-columns:340px 1fr;gap:18px;align-items:start">
+        <div style="display:grid;grid-template-columns:360px 1fr;gap:18px;align-items:start">
 
           <!-- Left column -->
           <div style="display:flex;flex-direction:column;gap:14px">
@@ -443,65 +637,115 @@ public class BackupModule implements DashboardModule {
                   <input type="checkbox" value="worlds">
                   <span class="bk-box"></span>
                   <div class="bk-ico"><i class="ti ti-world"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">Worlds</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">월드 데이터 파일</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">Worlds</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">월드 데이터 파일</div></div>
                 </label>
                 <label class="bk-chk">
                   <input type="checkbox" value="plugin-configs">
                   <span class="bk-box"></span>
                   <div class="bk-ico"><i class="ti ti-settings"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">Plugin Configs</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 설정 폴더</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">Plugin Configs</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 설정 폴더</div></div>
                 </label>
                 <label class="bk-chk">
                   <input type="checkbox" value="plugin-jars">
                   <span class="bk-box"></span>
                   <div class="bk-ico"><i class="ti ti-package"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">Plugin JARs</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 JAR 파일</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">Plugin JARs</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 JAR 파일</div></div>
                 </label>
                 <label class="bk-chk">
                   <input type="checkbox" value="root-configs">
                   <span class="bk-box"></span>
                   <div class="bk-ico"><i class="ti ti-file-description"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">Root Configs</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">server.properties, bukkit.yml 등</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">Root Configs</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">server.properties, bukkit.yml 등</div></div>
                 </label>
               </div>
 
               <div class="bk-lbl">저장 방식</div>
-              <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:16px">
+              <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:4px">
                 <label class="bk-radio">
                   <input type="radio" name="bk-storage" value="local" checked>
                   <span class="bk-dot"></span>
                   <div class="bk-ico"><i class="ti ti-server-2"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">서버에 저장</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">backups/ 폴더에 ZIP 저장</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">서버에 저장</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">backups/ 폴더에 ZIP 저장</div></div>
                 </label>
                 <label class="bk-radio">
                   <input type="radio" name="bk-storage" value="download">
                   <span class="bk-dot"></span>
                   <div class="bk-ico"><i class="ti ti-download"></i></div>
-                  <div>
-                    <div style="font-size:13px;font-weight:500">브라우저 다운로드</div>
-                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">완료 후 자동 ZIP 다운로드</div>
-                  </div>
+                  <div><div style="font-size:13px;font-weight:500">브라우저 다운로드</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">완료 후 자동 ZIP 다운로드</div></div>
+                </label>
+                <label class="bk-radio">
+                  <input type="radio" name="bk-storage" value="s3">
+                  <span class="bk-dot"></span>
+                  <div class="bk-ico"><i class="ti ti-cloud-upload"></i></div>
+                  <div><div style="font-size:13px;font-weight:500">Amazon S3 / 호환</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">S3, MinIO, Backblaze B2 등</div></div>
+                </label>
+                <label class="bk-radio">
+                  <input type="radio" name="bk-storage" value="sftp">
+                  <span class="bk-dot"></span>
+                  <div class="bk-ico"><i class="ti ti-server"></i></div>
+                  <div><div style="font-size:13px;font-weight:500">SFTP / NAS</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">SSH 파일 전송 프로토콜</div></div>
                 </label>
               </div>
 
-              <button id="bk-run" class="btn btn-primary" style="width:100%;justify-content:center;padding:8px">
-                <i class="ti ti-database-export"></i> Backup Now
-              </button>
+              <!-- S3 config panel -->
+              <div id="bk-s3-panel" class="bk-cfg-panel" style="display:none">
+                <div class="bk-lbl" style="margin-bottom:0">S3 설정</div>
+                <div class="bk-field">
+                  <label>Endpoint URL</label>
+                  <input id="bk-s3-endpoint" class="bk-input" type="text" placeholder="https://s3.amazonaws.com">
+                </div>
+                <div class="bk-field-row" style="grid-template-columns:1fr 120px">
+                  <div class="bk-field">
+                    <label>Bucket</label>
+                    <input id="bk-s3-bucket" class="bk-input" type="text" placeholder="my-bucket">
+                  </div>
+                  <div class="bk-field">
+                    <label>Region</label>
+                    <input id="bk-s3-region" class="bk-input" type="text" placeholder="us-east-1">
+                  </div>
+                </div>
+                <div class="bk-field">
+                  <label>Access Key ID</label>
+                  <input id="bk-s3-access" class="bk-input" type="text" placeholder="AKIAIOSFODNN7EXAMPLE">
+                </div>
+                <div class="bk-field">
+                  <label>Secret Access Key</label>
+                  <input id="bk-s3-secret" class="bk-input" type="password" placeholder="비어있으면 변경 안함">
+                </div>
+              </div>
+
+              <!-- SFTP config panel -->
+              <div id="bk-sftp-panel" class="bk-cfg-panel" style="display:none">
+                <div class="bk-lbl" style="margin-bottom:0">SFTP 설정</div>
+                <div class="bk-field-row" style="grid-template-columns:1fr 80px">
+                  <div class="bk-field">
+                    <label>Host</label>
+                    <input id="bk-sftp-host" class="bk-input" type="text" placeholder="192.168.1.100">
+                  </div>
+                  <div class="bk-field">
+                    <label>Port</label>
+                    <input id="bk-sftp-port" class="bk-num" type="number" min="1" max="65535" value="22" style="width:100%">
+                  </div>
+                </div>
+                <div class="bk-field">
+                  <label>Username</label>
+                  <input id="bk-sftp-user" class="bk-input" type="text" placeholder="admin">
+                </div>
+                <div class="bk-field">
+                  <label>Password</label>
+                  <input id="bk-sftp-pass" class="bk-input" type="password" placeholder="비어있으면 변경 안함">
+                </div>
+                <div class="bk-field">
+                  <label>Remote Path</label>
+                  <input id="bk-sftp-path" class="bk-input" type="text" placeholder="/backups">
+                </div>
+              </div>
+
+              <div style="margin-top:12px">
+                <button id="bk-run" class="btn btn-primary" style="width:100%;justify-content:center;padding:8px">
+                  <i class="ti ti-database-export"></i> Backup Now
+                </button>
+              </div>
               <div id="bk-status-box" class="bk-status">
                 <span id="bk-status-txt">—</span>
               </div>
@@ -590,6 +834,16 @@ public class BackupModule implements DashboardModule {
             document.getElementById('bk-status-txt').textContent = text;
           }
 
+          function syncStoragePanels() {
+            const v = document.querySelector('input[name=bk-storage]:checked')?.value || 'local';
+            document.getElementById('bk-s3-panel').style.display   = v === 's3'   ? '' : 'none';
+            document.getElementById('bk-sftp-panel').style.display = v === 'sftp' ? '' : 'none';
+          }
+
+          document.querySelectorAll('input[name=bk-storage]').forEach(r =>
+            r.addEventListener('change', syncStoragePanels)
+          );
+
           async function loadConfig() {
             const cfg = await bkFetch('GET', '/config');
             document.getElementById('bk-auto-en').checked = !!cfg.autoEnabled;
@@ -598,6 +852,27 @@ public class BackupModule implements DashboardModule {
             document.querySelectorAll('#bk-targets input').forEach(cb => {
               cb.checked = (cfg.targets || ['worlds']).includes(cb.value);
             });
+            // Set storage radio
+            const stor = cfg.storage || 'local';
+            const radio = document.querySelector('input[name=bk-storage][value="' + stor + '"]');
+            if (radio) radio.checked = true;
+            syncStoragePanels();
+            // S3
+            if (cfg.s3) {
+              document.getElementById('bk-s3-endpoint').value = cfg.s3.endpoint || '';
+              document.getElementById('bk-s3-bucket').value   = cfg.s3.bucket   || '';
+              document.getElementById('bk-s3-region').value   = cfg.s3.region   || '';
+              document.getElementById('bk-s3-access').value   = cfg.s3.accessKey|| '';
+              document.getElementById('bk-s3-secret').value   = cfg.s3.secretKey|| '';
+            }
+            // SFTP
+            if (cfg.sftp) {
+              document.getElementById('bk-sftp-host').value = cfg.sftp.host       || '';
+              document.getElementById('bk-sftp-port').value = cfg.sftp.port       || 22;
+              document.getElementById('bk-sftp-user').value = cfg.sftp.username   || '';
+              document.getElementById('bk-sftp-pass').value = cfg.sftp.password   || '';
+              document.getElementById('bk-sftp-path').value = cfg.sftp.remotePath || '/backups';
+            }
           }
 
           async function loadList() {
@@ -648,7 +923,6 @@ public class BackupModule implements DashboardModule {
               a.style.display = 'none';
               document.body.appendChild(a);
               a.click();
-              // revoke after 60s — do NOT revoke immediately, download hasn't started yet
               setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 60_000);
               toast('다운로드 시작됨', 'success');
             } catch (e) {
@@ -692,11 +966,26 @@ public class BackupModule implements DashboardModule {
 
           document.getElementById('bk-cfg-save').addEventListener('click', async () => {
             const targets = [...document.querySelectorAll('#bk-targets input:checked')].map(c => c.value);
+            const storage = document.querySelector('input[name=bk-storage]:checked').value;
             const body = {
-              targets,
+              targets, storage,
               autoEnabled:   document.getElementById('bk-auto-en').checked,
               intervalHours: parseInt(document.getElementById('bk-auto-hr').value) || 24,
-              maxBackups:    parseInt(document.getElementById('bk-auto-max').value) || 5
+              maxBackups:    parseInt(document.getElementById('bk-auto-max').value) || 5,
+              s3: {
+                endpoint:  document.getElementById('bk-s3-endpoint').value.trim(),
+                bucket:    document.getElementById('bk-s3-bucket').value.trim(),
+                region:    document.getElementById('bk-s3-region').value.trim(),
+                accessKey: document.getElementById('bk-s3-access').value.trim(),
+                secretKey: document.getElementById('bk-s3-secret').value,
+              },
+              sftp: {
+                host:       document.getElementById('bk-sftp-host').value.trim(),
+                port:       parseInt(document.getElementById('bk-sftp-port').value) || 22,
+                username:   document.getElementById('bk-sftp-user').value.trim(),
+                password:   document.getElementById('bk-sftp-pass').value,
+                remotePath: document.getElementById('bk-sftp-path').value.trim(),
+              }
             };
             await bkFetch('POST', '/config', body);
             toast('설정 저장됨', 'success');
