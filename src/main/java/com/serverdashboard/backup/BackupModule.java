@@ -347,49 +347,212 @@ public class BackupModule implements DashboardModule {
     @Override public String getInitScript()  { return JS;   }
 
     private static final String HTML = """
-        <div style="display:grid;grid-template-columns:320px 1fr;gap:18px;align-items:start">
-          <div style="display:flex;flex-direction:column;gap:18px">
-            <div class="card" style="padding:18px">
-              <div style="font-size:14px;font-weight:600;margin-bottom:14px">백업 생성</div>
-              <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:8px">대상</div>
-              <div id="bk-targets" style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" value="worlds"> Worlds</label>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" value="plugin-configs"> Plugin Configs</label>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" value="plugin-jars"> Plugin JARs</label>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" value="root-configs"> Root Configs</label>
+        <style>
+        /* ── Backup module components ──────────────────────── */
+        .bk-chk,.bk-radio{
+          display:flex;align-items:center;gap:10px;cursor:pointer;
+          padding:8px 10px;border-radius:7px;font-size:13px;
+          border:1.5px solid transparent;transition:all .13s;user-select:none;
+        }
+        .bk-chk:hover,.bk-radio:hover{background:var(--surface-2);border-color:var(--border);}
+        .bk-chk:has(input:checked),.bk-radio:has(input:checked){
+          background:var(--accent-dim);border-color:rgba(99,102,241,.3);
+        }
+        .bk-chk input,.bk-radio input{display:none;}
+
+        /* custom checkbox box */
+        .bk-box{
+          width:17px;height:17px;border-radius:4px;flex-shrink:0;
+          border:1.5px solid var(--border-2);background:var(--surface-3);
+          display:flex;align-items:center;justify-content:center;
+          transition:all .13s;
+        }
+        .bk-chk:hover .bk-box{border-color:var(--accent);}
+        .bk-chk:has(input:checked) .bk-box{background:var(--accent);border-color:var(--accent);}
+        .bk-chk:has(input:checked) .bk-box::after{
+          content:'✓';color:#fff;font-size:10px;font-weight:800;line-height:1;
+        }
+
+        /* custom radio dot */
+        .bk-dot{
+          width:17px;height:17px;border-radius:50%;flex-shrink:0;
+          border:1.5px solid var(--border-2);background:var(--surface-3);
+          position:relative;transition:all .13s;
+        }
+        .bk-radio:hover .bk-dot{border-color:var(--accent);}
+        .bk-radio:has(input:checked) .bk-dot{border-color:var(--accent);}
+        .bk-radio:has(input:checked) .bk-dot::after{
+          content:'';width:8px;height:8px;border-radius:50%;
+          background:var(--accent);position:absolute;
+          top:50%;left:50%;transform:translate(-50%,-50%);
+        }
+
+        /* option icon badge */
+        .bk-ico{
+          width:32px;height:32px;border-radius:7px;flex-shrink:0;
+          background:var(--surface-3);
+          display:flex;align-items:center;justify-content:center;
+          transition:all .13s;
+        }
+        .bk-ico i{font-size:16px;color:var(--text-2);transition:color .13s;}
+        .bk-chk:has(input:checked) .bk-ico,
+        .bk-radio:has(input:checked) .bk-ico{background:rgba(99,102,241,.18);}
+        .bk-chk:has(input:checked) .bk-ico i,
+        .bk-radio:has(input:checked) .bk-ico i{color:var(--accent-2);}
+
+        /* number input */
+        .bk-num{
+          background:var(--surface-2);border:1px solid var(--border-2);
+          border-radius:6px;padding:6px 9px;color:var(--text);
+          font-size:13px;font-family:var(--font);
+          transition:border-color .12s;text-align:center;
+        }
+        .bk-num:focus{outline:none;border-color:var(--accent);}
+
+        /* section label */
+        .bk-lbl{
+          font-size:10.5px;font-weight:600;text-transform:uppercase;
+          letter-spacing:.6px;color:var(--text-3);padding:0 2px;margin-bottom:5px;
+        }
+
+        /* status bar */
+        .bk-status{
+          display:none;margin-top:10px;padding:9px 12px;
+          border-radius:6px;border-left:3px solid var(--accent);
+          background:var(--surface-3);font-size:12px;
+          font-family:var(--mono);color:var(--text-2);
+        }
+        .bk-status.done{border-left-color:var(--green);}
+        .bk-status.err{border-left-color:var(--red);}
+        </style>
+
+        <div style="display:grid;grid-template-columns:340px 1fr;gap:18px;align-items:start">
+
+          <!-- Left column -->
+          <div style="display:flex;flex-direction:column;gap:14px">
+
+            <!-- Create Backup -->
+            <div class="card" style="padding:16px">
+              <div style="font-size:13.5px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:7px">
+                <i class="ti ti-database-export" style="font-size:16px;color:var(--accent-2)"></i> 백업 생성
               </div>
-              <div style="font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:8px">저장 방식</div>
-              <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="radio" name="bk-storage" value="local" checked> 서버에 저장</label>
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="radio" name="bk-storage" value="download"> 브라우저 다운로드</label>
+
+              <div class="bk-lbl">대상</div>
+              <div id="bk-targets" style="display:flex;flex-direction:column;gap:3px;margin-bottom:14px">
+                <label class="bk-chk">
+                  <input type="checkbox" value="worlds">
+                  <span class="bk-box"></span>
+                  <div class="bk-ico"><i class="ti ti-world"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">Worlds</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">월드 데이터 파일</div>
+                  </div>
+                </label>
+                <label class="bk-chk">
+                  <input type="checkbox" value="plugin-configs">
+                  <span class="bk-box"></span>
+                  <div class="bk-ico"><i class="ti ti-settings"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">Plugin Configs</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 설정 폴더</div>
+                  </div>
+                </label>
+                <label class="bk-chk">
+                  <input type="checkbox" value="plugin-jars">
+                  <span class="bk-box"></span>
+                  <div class="bk-ico"><i class="ti ti-package"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">Plugin JARs</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">플러그인 JAR 파일</div>
+                  </div>
+                </label>
+                <label class="bk-chk">
+                  <input type="checkbox" value="root-configs">
+                  <span class="bk-box"></span>
+                  <div class="bk-ico"><i class="ti ti-file-description"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">Root Configs</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">server.properties, bukkit.yml 등</div>
+                  </div>
+                </label>
               </div>
-              <button id="bk-run" class="btn" style="width:100%;justify-content:center"><i class="ti ti-database-export"></i>&nbsp;Backup Now</button>
-              <div id="bk-status-box" style="display:none;margin-top:12px;padding:10px 12px;background:var(--surface-3);border-radius:6px;font-size:12px;font-family:var(--mono);color:var(--text-2)">
+
+              <div class="bk-lbl">저장 방식</div>
+              <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:16px">
+                <label class="bk-radio">
+                  <input type="radio" name="bk-storage" value="local" checked>
+                  <span class="bk-dot"></span>
+                  <div class="bk-ico"><i class="ti ti-server-2"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">서버에 저장</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">backups/ 폴더에 ZIP 저장</div>
+                  </div>
+                </label>
+                <label class="bk-radio">
+                  <input type="radio" name="bk-storage" value="download">
+                  <span class="bk-dot"></span>
+                  <div class="bk-ico"><i class="ti ti-download"></i></div>
+                  <div>
+                    <div style="font-size:13px;font-weight:500">브라우저 다운로드</div>
+                    <div style="font-size:11.5px;color:var(--text-2);margin-top:1px">완료 후 자동 ZIP 다운로드</div>
+                  </div>
+                </label>
+              </div>
+
+              <button id="bk-run" class="btn btn-primary" style="width:100%;justify-content:center;padding:8px">
+                <i class="ti ti-database-export"></i> Backup Now
+              </button>
+              <div id="bk-status-box" class="bk-status">
                 <span id="bk-status-txt">—</span>
               </div>
             </div>
-            <div class="card" style="padding:18px">
-              <div style="font-size:14px;font-weight:600;margin-bottom:14px">자동 백업</div>
-              <div style="display:flex;flex-direction:column;gap:11px">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px"><input type="checkbox" id="bk-auto-en"> 자동 백업 활성화</label>
-                <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2)">
-                  매&nbsp;<input type="number" id="bk-auto-hr" min="1" max="168" value="24"
-                    style="width:56px;background:var(--surface-3);border:1px solid var(--border-2);border-radius:5px;padding:4px 8px;color:var(--text);font-size:13px">&nbsp;시간
+
+            <!-- Auto Backup -->
+            <div class="card" style="padding:16px">
+              <div style="font-size:13.5px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:7px">
+                <i class="ti ti-clock-play" style="font-size:16px;color:var(--accent-2)"></i> 자동 백업
+              </div>
+              <div style="display:flex;flex-direction:column;gap:12px">
+                <div class="toggle-row">
+                  <label class="toggle">
+                    <input type="checkbox" id="bk-auto-en">
+                    <span class="tgl-track"></span>
+                    <span class="tgl-thumb"></span>
+                  </label>
+                  <span style="font-size:13px;font-weight:500">자동 백업 활성화</span>
                 </div>
-                <div style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-2)">
-                  최대&nbsp;<input type="number" id="bk-auto-max" min="1" max="50" value="5"
-                    style="width:56px;background:var(--surface-3);border:1px solid var(--border-2);border-radius:5px;padding:4px 8px;color:var(--text);font-size:13px">&nbsp;개 보관
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                  <div>
+                    <div class="bk-lbl" style="margin-bottom:6px">주기</div>
+                    <div style="display:flex;align-items:center;gap:7px">
+                      <input type="number" id="bk-auto-hr" class="bk-num" min="1" max="168" value="24" style="flex:1">
+                      <span style="font-size:12px;color:var(--text-2)">시간</span>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="bk-lbl" style="margin-bottom:6px">최대 보관</div>
+                    <div style="display:flex;align-items:center;gap:7px">
+                      <input type="number" id="bk-auto-max" class="bk-num" min="1" max="50" value="5" style="flex:1">
+                      <span style="font-size:12px;color:var(--text-2)">개</span>
+                    </div>
+                  </div>
                 </div>
-                <button id="bk-cfg-save" class="btn" style="width:100%;justify-content:center">설정 저장</button>
+                <button id="bk-cfg-save" class="btn btn-ghost" style="width:100%;justify-content:center">
+                  <i class="ti ti-device-floppy"></i> 설정 저장
+                </button>
               </div>
             </div>
           </div>
-          <div class="card" style="padding:18px">
+
+          <!-- Right column: list -->
+          <div class="card" style="padding:16px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-              <div style="font-size:14px;font-weight:600">저장된 백업</div>
-              <button id="bk-refresh" class="btn" style="padding:5px 10px;font-size:12px"><i class="ti ti-refresh"></i></button>
+              <div style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:7px">
+                <i class="ti ti-history" style="font-size:16px;color:var(--accent-2)"></i> 저장된 백업
+              </div>
+              <button id="bk-refresh" class="btn btn-ghost btn-sm"><i class="ti ti-refresh"></i> 새로고침</button>
             </div>
-            <div id="bk-list" style="display:flex;flex-direction:column;gap:8px">
+            <div id="bk-list" style="display:flex;flex-direction:column;gap:6px">
               <span style="color:var(--text-2);font-size:13px">불러오는 중...</span>
             </div>
           </div>
@@ -414,6 +577,19 @@ public class BackupModule implements DashboardModule {
             return (b / 1048576).toFixed(1) + ' MB';
           }
 
+          function fmtDate(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+          }
+
+          function setStatus(text, state) {
+            const box = document.getElementById('bk-status-box');
+            box.style.display = 'block';
+            box.className = 'bk-status' + (state ? ' ' + state : '');
+            document.getElementById('bk-status-txt').textContent = text;
+          }
+
           async function loadConfig() {
             const cfg = await bkFetch('GET', '/config');
             document.getElementById('bk-auto-en').checked = !!cfg.autoEnabled;
@@ -428,18 +604,31 @@ public class BackupModule implements DashboardModule {
             const list = await bkFetch('GET', '/list');
             const el = document.getElementById('bk-list');
             if (!Array.isArray(list) || !list.length) {
-              el.innerHTML = '<span style="color:var(--text-2);font-size:13px">백업 없음</span>';
+              el.innerHTML = '<div class="empty"><i class="ti ti-database-off"></i><p>저장된 백업 없음</p></div>';
               return;
             }
             el.innerHTML = list.map(f => `
-              <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--surface-3);border-radius:7px">
-                <i class="ti ti-file-zip" style="color:var(--accent-2);font-size:18px;flex-shrink:0"></i>
-                <div style="flex:1;min-width:0">
-                  <div style="font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)">${f.name}</div>
-                  <div style="font-size:11px;color:var(--text-2);margin-top:1px">${fmtSize(f.size)}</div>
+              <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;
+                background:var(--surface-2);border-radius:8px;border:1px solid var(--border)">
+                <div style="width:34px;height:34px;border-radius:7px;background:var(--accent-dim);
+                  display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                  <i class="ti ti-file-zip" style="font-size:17px;color:var(--accent-2)"></i>
                 </div>
-                <button onclick="bkDl('${f.name}')" class="btn" style="padding:5px 10px;font-size:12px" title="다운로드"><i class="ti ti-download"></i></button>
-                <button onclick="bkDel('${f.name}')" class="btn" style="padding:5px 10px;font-size:12px;color:var(--red)" title="삭제"><i class="ti ti-trash"></i></button>
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:12.5px;font-weight:500;font-family:var(--mono);
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${f.name}</div>
+                  <div style="font-size:11px;color:var(--text-2);margin-top:2px">
+                    ${fmtSize(f.size)}&nbsp;·&nbsp;${fmtDate(f.modified)}
+                  </div>
+                </div>
+                <div class="btn-grp">
+                  <button onclick="bkDl('${f.name}')" class="btn btn-ghost btn-sm" title="다운로드">
+                    <i class="ti ti-download"></i>
+                  </button>
+                  <button onclick="bkDel('${f.name}')" class="btn btn-danger btn-sm" title="삭제">
+                    <i class="ti ti-trash"></i>
+                  </button>
+                </div>
               </div>
             `).join('');
           }
@@ -465,11 +654,13 @@ public class BackupModule implements DashboardModule {
             if (pollId) clearInterval(pollId);
             pollId = setInterval(async () => {
               const s = await bkFetch('GET', '/status');
-              document.getElementById('bk-status-txt').textContent = s.status || '';
-              if (!s.running) {
+              const isDone = !s.running;
+              const isErr  = s.status && s.status.startsWith('Error');
+              setStatus(s.status || '', isDone ? (isErr ? 'err' : 'done') : '');
+              if (isDone) {
                 clearInterval(pollId); pollId = null;
                 loadList();
-                if (doDownload && s.status && s.status.startsWith('Done:')) bkDl(filename);
+                if (doDownload && !isErr) bkDl(filename);
               }
             }, 1000);
           }
@@ -481,8 +672,7 @@ public class BackupModule implements DashboardModule {
             const resp = await bkFetch('POST', '/run', { targets, storage });
             if (resp.error) { toast(resp.error, 'error'); return; }
             toast('백업 시작됨', 'success');
-            document.getElementById('bk-status-box').style.display = 'block';
-            document.getElementById('bk-status-txt').textContent = '시작 중...';
+            setStatus('시작 중...', '');
             startPoll(resp.file, storage === 'download');
           });
 
