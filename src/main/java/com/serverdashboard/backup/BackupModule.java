@@ -1014,26 +1014,18 @@ public class BackupModule implements DashboardModule {
             `).join('');
           }
 
-          window.bkDl = async function(name) {
-            toast('다운로드 준비 중...', 'success');
-            try {
-              const r = await fetch(BASE + '/download/' + name, {
-                headers: { 'Authorization': 'Bearer ' + tok() }
-              });
-              if (!r.ok) { toast('다운로드 실패 (HTTP ' + r.status + ')', 'error'); return; }
-              const blob = await r.blob();
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = name;
-              a.style.display = 'none';
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 60_000);
-              toast('다운로드 시작됨', 'success');
-            } catch (e) {
-              toast('다운로드 오류: ' + e.message, 'error');
-            }
+          window.bkDl = function(name) {
+            // Use browser-native download — avoids fetch+blob memory issues with large files.
+            // The server accepts ?t=TOKEN as equivalent to Authorization: Bearer TOKEN.
+            const url = BASE + '/download/' + encodeURIComponent(name) + '?t=' + encodeURIComponent(tok());
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => document.body.removeChild(a), 200);
+            toast('다운로드 시작됨', 'success');
           };
 
           window.bkDel = async function(name) {
