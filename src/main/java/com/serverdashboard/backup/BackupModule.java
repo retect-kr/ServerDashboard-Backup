@@ -54,6 +54,12 @@ public class BackupModule implements DashboardModule {
     private String cfgSftpPass = "";
     private String cfgSftpPath = "/backups";
 
+    // WebDAV config
+    private String cfgWebdavUrl  = "";
+    private String cfgWebdavUser = "";
+    private String cfgWebdavPass = "";
+    private String cfgWebdavPath = "";
+
     // Auto backup config
     private boolean cfgAutoEnabled   = false;
     private int     cfgIntervalHours = 24;
@@ -125,6 +131,9 @@ public class BackupModule implements DashboardModule {
                 } else if ("sftp".equals(storage)) {
                     statusMsg = "Uploading via SFTP...";
                     uploadToSftp(zipPath, filename);
+                } else if ("webdav".equals(storage)) {
+                    statusMsg = "Uploading via WebDAV...";
+                    uploadToWebdav(zipPath, filename);
                 }
                 if (cfgMaxBackups > 0) pruneOld();
                 statusMsg = "Done: " + filename;
@@ -223,6 +232,14 @@ public class BackupModule implements DashboardModule {
             if (sftp.has("password") && !sftp.get("password").getAsString().equals("***"))
                 cfgSftpPass = sftp.get("password").getAsString();
             if (sftp.has("remotePath")) cfgSftpPath = sftp.get("remotePath").getAsString();
+        }
+        if (body.has("webdav")) {
+            JsonObject wd = body.getAsJsonObject("webdav");
+            if (wd.has("url"))        cfgWebdavUrl  = wd.get("url").getAsString();
+            if (wd.has("username"))   cfgWebdavUser = wd.get("username").getAsString();
+            if (wd.has("password") && !wd.get("password").getAsString().equals("***"))
+                cfgWebdavPass = wd.get("password").getAsString();
+            if (wd.has("remotePath")) cfgWebdavPath = wd.get("remotePath").getAsString();
         }
 
         saveConfig();
@@ -376,6 +393,41 @@ public class BackupModule implements DashboardModule {
         } finally { session.disconnect(); }
     }
 
+    // ── WebDAV Upload ─────────────────────────────────────────────────────────
+
+    private void uploadToWebdav(Path file, String name) throws Exception {
+        String base = cfgWebdavUrl.replaceAll("/+$", "");
+        String dir  = cfgWebdavPath.isBlank() ? base
+                    : base + "/" + cfgWebdavPath.replaceAll("^/+|/+$", "");
+
+        String auth = cfgWebdavUser.isBlank() ? null
+                    : "Basic " + Base64.getEncoder().encodeToString(
+                          (cfgWebdavUser + ":" + cfgWebdavPass).getBytes(StandardCharsets.UTF_8));
+
+        // MKCOL — create directory (405/409 both mean it already exists, ignore)
+        HttpURLConnection mkcol = (HttpURLConnection) new URL(dir).openConnection();
+        mkcol.setRequestMethod("MKCOL");
+        if (auth != null) mkcol.setRequestProperty("Authorization", auth);
+        int mkStatus = mkcol.getResponseCode();
+        mkcol.disconnect();
+        if (mkStatus / 100 != 2 && mkStatus != 405 && mkStatus != 409)
+            throw new IOException("WebDAV MKCOL failed: HTTP " + mkStatus);
+
+        // PUT the file
+        HttpURLConnection put = (HttpURLConnection) new URL(dir + "/" + name).openConnection();
+        put.setRequestMethod("PUT");
+        put.setFixedLengthStreamingMode(Files.size(file));
+        put.setRequestProperty("Content-Type", "application/zip");
+        if (auth != null) put.setRequestProperty("Authorization", auth);
+        put.setDoOutput(true);
+        try (InputStream in = Files.newInputStream(file); OutputStream out = put.getOutputStream()) {
+            in.transferTo(out);
+        }
+        int status = put.getResponseCode();
+        put.disconnect();
+        if (status / 100 != 2) throw new IOException("WebDAV PUT failed: HTTP " + status);
+    }
+
     // ── Crypto helpers ────────────────────────────────────────────────────────
 
     private static String sha256Hex(Path file) throws Exception {
@@ -437,6 +489,9 @@ public class BackupModule implements DashboardModule {
             } else if ("sftp".equals(cfgStorage)) {
                 statusMsg = "Auto: Uploading via SFTP...";
                 uploadToSftp(zipPath, filename);
+            } else if ("webdav".equals(cfgStorage)) {
+                statusMsg = "Auto: Uploading via WebDAV...";
+                uploadToWebdav(zipPath, filename);
             }
             if (cfgMaxBackups > 0) pruneOld();
             statusMsg = "Done: " + filename;
@@ -481,6 +536,13 @@ public class BackupModule implements DashboardModule {
                 if (sftp.has("password"))   cfgSftpPass = sftp.get("password").getAsString();
                 if (sftp.has("remotePath")) cfgSftpPath = sftp.get("remotePath").getAsString();
             }
+            if (o.has("webdav")) {
+                JsonObject wd = o.getAsJsonObject("webdav");
+                if (wd.has("url"))        cfgWebdavUrl  = wd.get("url").getAsString();
+                if (wd.has("username"))   cfgWebdavUser = wd.get("username").getAsString();
+                if (wd.has("password"))   cfgWebdavPass = wd.get("password").getAsString();
+                if (wd.has("remotePath")) cfgWebdavPath = wd.get("remotePath").getAsString();
+            }
         } catch (Exception e) {
             plugin.getLogger().warning("[Backup] Config load failed: " + e.getMessage());
         }
@@ -518,6 +580,13 @@ public class BackupModule implements DashboardModule {
         sftp.addProperty("password",   includeSensitive ? cfgSftpPass : (cfgSftpPass.isEmpty() ? "" : "***"));
         sftp.addProperty("remotePath", cfgSftpPath);
         o.add("sftp", sftp);
+
+        JsonObject wd = new JsonObject();
+        wd.addProperty("url",        cfgWebdavUrl);
+        wd.addProperty("username",   cfgWebdavUser);
+        wd.addProperty("password",   includeSensitive ? cfgWebdavPass : (cfgWebdavPass.isEmpty() ? "" : "***"));
+        wd.addProperty("remotePath", cfgWebdavPath);
+        o.add("webdav", wd);
 
         return o;
     }
@@ -685,6 +754,12 @@ public class BackupModule implements DashboardModule {
                   <div class="bk-ico"><i class="ti ti-server"></i></div>
                   <div><div style="font-size:13px;font-weight:500">SFTP / NAS</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">SSH 파일 전송 프로토콜</div></div>
                 </label>
+                <label class="bk-radio">
+                  <input type="radio" name="bk-storage" value="webdav">
+                  <span class="bk-dot"></span>
+                  <div class="bk-ico"><i class="ti ti-topology-star-3"></i></div>
+                  <div><div style="font-size:13px;font-weight:500">WebDAV</div><div style="font-size:11.5px;color:var(--text-2);margin-top:1px">Synology, QNAP, Nextcloud 등</div></div>
+                </label>
               </div>
 
               <!-- S3 config panel -->
@@ -738,6 +813,29 @@ public class BackupModule implements DashboardModule {
                 <div class="bk-field">
                   <label>Remote Path</label>
                   <input id="bk-sftp-path" class="bk-input" type="text" placeholder="/backups">
+                </div>
+              </div>
+
+              <!-- WebDAV config panel -->
+              <div id="bk-webdav-panel" class="bk-cfg-panel" style="display:none">
+                <div class="bk-lbl" style="margin-bottom:0">WebDAV 설정</div>
+                <div class="bk-field">
+                  <label>서버 URL</label>
+                  <input id="bk-wd-url" class="bk-input" type="text" placeholder="https://nas.local/dav">
+                </div>
+                <div class="bk-field-row" style="grid-template-columns:1fr 1fr">
+                  <div class="bk-field">
+                    <label>Username</label>
+                    <input id="bk-wd-user" class="bk-input" type="text" placeholder="admin">
+                  </div>
+                  <div class="bk-field">
+                    <label>Password</label>
+                    <input id="bk-wd-pass" class="bk-input" type="password" placeholder="비어있으면 변경 안함">
+                  </div>
+                </div>
+                <div class="bk-field">
+                  <label>원격 경로 (선택)</label>
+                  <input id="bk-wd-path" class="bk-input" type="text" placeholder="minecraft-backups">
                 </div>
               </div>
 
@@ -836,8 +934,9 @@ public class BackupModule implements DashboardModule {
 
           function syncStoragePanels() {
             const v = document.querySelector('input[name=bk-storage]:checked')?.value || 'local';
-            document.getElementById('bk-s3-panel').style.display   = v === 's3'   ? '' : 'none';
-            document.getElementById('bk-sftp-panel').style.display = v === 'sftp' ? '' : 'none';
+            document.getElementById('bk-s3-panel').style.display     = v === 's3'     ? '' : 'none';
+            document.getElementById('bk-sftp-panel').style.display   = v === 'sftp'   ? '' : 'none';
+            document.getElementById('bk-webdav-panel').style.display = v === 'webdav' ? '' : 'none';
           }
 
           document.querySelectorAll('input[name=bk-storage]').forEach(r =>
@@ -872,6 +971,13 @@ public class BackupModule implements DashboardModule {
               document.getElementById('bk-sftp-user').value = cfg.sftp.username   || '';
               document.getElementById('bk-sftp-pass').value = cfg.sftp.password   || '';
               document.getElementById('bk-sftp-path').value = cfg.sftp.remotePath || '/backups';
+            }
+            // WebDAV
+            if (cfg.webdav) {
+              document.getElementById('bk-wd-url').value  = cfg.webdav.url        || '';
+              document.getElementById('bk-wd-user').value = cfg.webdav.username   || '';
+              document.getElementById('bk-wd-pass').value = cfg.webdav.password   || '';
+              document.getElementById('bk-wd-path').value = cfg.webdav.remotePath || '';
             }
           }
 
@@ -985,6 +1091,12 @@ public class BackupModule implements DashboardModule {
                 username:   document.getElementById('bk-sftp-user').value.trim(),
                 password:   document.getElementById('bk-sftp-pass').value,
                 remotePath: document.getElementById('bk-sftp-path').value.trim(),
+              },
+              webdav: {
+                url:        document.getElementById('bk-wd-url').value.trim(),
+                username:   document.getElementById('bk-wd-user').value.trim(),
+                password:   document.getElementById('bk-wd-pass').value,
+                remotePath: document.getElementById('bk-wd-path').value.trim(),
               }
             };
             await bkFetch('POST', '/config', body);
